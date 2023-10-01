@@ -10,5 +10,9 @@ f64 = []
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+crossbeam-channel = "0.5.8"
 half = "2.3.1"
+packed_simd = "0.3.9"
 rand = "0.8.5"
+rayon = "1.8.0"
+rustacuda = "0.1.3"

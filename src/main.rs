@@ -1,8 +1,18 @@
+use std::time::Instant;
+
 use matix::matrix::Matrix;
 
 fn main(){
-    let m = Matrix::new(vec![1.2,1.3]);
-    let m2 = Matrix::new(vec![1.2,1.3]);
-    let m3 = m+m2;
-    print!("{}", m3[0][0]) 
+    // let m1 = Matrix::new(vec![vec![1.04, 1.95], vec![1.44, 1.58]]);
+    // let m2 = Matrix::new(vec![vec![1.39, 1.76], vec![2.00, 1.02]]);
+    let m1 = Matrix::random(10000, 10000, 0.0, 1.0);
+    let m2 = Matrix::random(10000, 10000, 0.0, 1.0);
+    // let start = Instant::now();
+    // let m3 = m1.__standart_multiply(&m2);
+    // let end = start.elapsed();
+    // println!("{:?}", end);
+    let start = Instant::now();
+    let _m3 = m1.__strassen_multiply(&m2);
+    let end = start.elapsed();
+    println!("{:?}", end);
 }
