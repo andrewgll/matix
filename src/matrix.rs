@@ -1,9 +1,11 @@
 use core::fmt;
-use std::{ops::{Index, Add, AddAssign, Sub, SubAssign, Mul, MulAssign, Range, RangeFrom}, cmp::max, arch::asm};
+use std::{ops::{Index, Add, AddAssign, Sub, SubAssign, Mul, MulAssign, Range, RangeFrom}, cmp::max, arch::asm, sync::Mutex};
 use crossbeam_channel::bounded;
 use packed_simd::f32x16;
 use rand::Rng;
 use rayon::prelude::*;
+
+use crate::matrix_memory_pool::MemoryPool;
 #[derive(Clone)]
 #[derive(Debug)]
 pub struct Matrix{
@@ -16,51 +18,72 @@ impl Matrix{
     pub fn new<T: IntoMatrix>(data: T) -> Self{
         data.into_matrix()
     }
-    pub fn random(rows: usize, cols: usize, min:f32, max:f32) -> Self{
+    pub fn with_dimensions(rows: usize, cols: usize) -> Self {
+        Matrix {
+            rows,
+            cols,
+            data: vec![0.0; rows * cols],  // Initialize the matrix with zeros
+        }
+    }
+    pub fn randomf(rows: usize, cols: usize, min:f32, max:f32) -> Self{
         let mut rng = rand::thread_rng();
         let data: Vec<f32> = (0..rows * cols)
-            .map(|_| rng.gen_range(min..max))
-            .collect();
+        .map(|_| rng.gen_range(min..max))
+        .collect();
         Matrix { rows: rows, cols: cols, data: data }
     }
-    pub fn __strassen_multiply(&self, other: &Matrix) -> Matrix {
+    pub fn random(rows: usize, cols: usize, min: i32, max: i32) -> Self {
+        let mut rng = rand::thread_rng();
+        let data: Vec<f32> = (0..rows * cols)
+            .map(|_| rng.gen_range(min..max) as f32)
+            .collect();
+        Matrix { rows, cols, data }
+    }
+    pub fn strassen_multiply(&self, other: &Matrix) -> Matrix {
         assert_eq!(self.cols, other.rows);
 
-        // Base case
-        if max(self.rows, self.cols) <= 64 {
-            return 
-            Matrix {
+        let chunk_size = self.rows / 2; 
+        let num_chunks =50000; 
+        let pool = Mutex::new(MemoryPool::new(chunk_size, num_chunks));
+
+        self._strassen_multiply_recursive(other, &pool)
+    }
+    fn _strassen_multiply_recursive(&self, other: &Matrix, pool: &Mutex<MemoryPool>) -> Matrix {
+        assert_eq!(self.cols, other.rows);
+    
+        if max(self.rows, self.cols) <= 256 {
+            return Matrix {
                 cols: self.cols,
                 rows: self.rows,
                 data: self.__rayon_simd_multiply(&other)
             };
         }
-
-        let (a11, a12, a21, a22) = self.split();
-        let (b11, b12, b21, b22) = other.split();
-
+    
+        let (mut a11, mut a12, mut a21, mut a22) = self.split(&mut pool.lock().unwrap());
+        let (mut b11, mut b12, mut b21, mut b22) = other.split(&mut pool.lock().unwrap());
+        
         let (sender, receiver) = bounded(7); 
         rayon::scope(|s| {
             s.spawn(|_| {
-                sender.send(a11.__strassen_multiply(&(&b12 - &b22))).unwrap();
+                sender.send(a11._strassen_multiply_recursive(&(&b12 - &b22), pool)).unwrap();
             });
             s.spawn(|_| {
-                sender.send((&a11 + &a12).__strassen_multiply(&b22)).unwrap();
+                sender.send((&a11 + &a12)._strassen_multiply_recursive(&b22, pool)).unwrap();
             });
             s.spawn( |_| {
-                sender.send((&a21 + &a22).__strassen_multiply(&b11)).unwrap(); 
+                sender.send((&a21 + &a22)._strassen_multiply_recursive(&b11, pool)).unwrap(); 
             });
             s.spawn( |_| {
-                sender.send(a22.__strassen_multiply(&(&b21 - &b11))).unwrap(); 
+                sender.send(a22._strassen_multiply_recursive(&(&b21 - &b11), pool)).unwrap(); 
             });
             s.spawn(|_| {
-                sender.send((&a11 + &a22).__strassen_multiply(&(&b11 + &b22))).unwrap(); 
+                sender.send((&a11 + &a22)._strassen_multiply_recursive(&(&b11 + &b22), pool)).unwrap(); 
             });
             s.spawn(|_| {
-                sender.send((&a12 - &a22).__strassen_multiply(&(&b21 + &b22))).unwrap(); 
+                sender.send((&a12 - &a22)._strassen_multiply_recursive(&(&b21 + &b22), pool)).unwrap(); 
             });
             s.spawn(|_| {
-                sender.send((&a11 - &a21).__strassen_multiply(&(&b11 + &b12))).unwrap();
+                sender.send((&a11 - &a21)._strassen_multiply_recursive(&(&b11 + &b12), pool)).unwrap();
             });
         });
         let results: Vec<Matrix> = receiver.iter().take(7).collect();
@@ -68,35 +91,44 @@ impl Matrix{
         let c12 = &results[0] + &results[1];
         let c21 = &results[2] + &results[3];
         let c22 = &(&(&results[4] + &results[0]) - &results[2]) - &results[6];
-    
-        // Merge the results
+        {
+            let mut locked_pool = pool.lock().unwrap();
+            locked_pool.deallocate(&mut a11);
+            locked_pool.deallocate(&mut a12);
+            locked_pool.deallocate(&mut a21);
+            locked_pool.deallocate(&mut a22);
+            locked_pool.deallocate(&mut b11);
+            locked_pool.deallocate(&mut b12);
+            locked_pool.deallocate(&mut b21);
+            locked_pool.deallocate(&mut b22);
+        }
         Matrix::merge(c11, c12, c21, c22)
-    }
-    fn split(&self) -> (Matrix, Matrix, Matrix, Matrix) {
+    }     
+    pub fn split(&self, pool: &mut MemoryPool) -> (Matrix, Matrix, Matrix, Matrix) {
         let mid = self.rows / 2;
         
-        let mut a11_data = Vec::with_capacity(mid * mid);
-        let mut a12_data = Vec::with_capacity(mid * mid);
-        let mut a21_data = Vec::with_capacity(mid * mid);
-        let mut a22_data = Vec::with_capacity(mid * mid);
-    
+        // Fetch matrices from the pool
+        let mut a11 = pool.allocate().expect("Failed to allocate memory for a11").clone();
+        let mut a12 = pool.allocate().expect("Failed to allocate memory for a12").clone();
+        let mut a21 = pool.allocate().expect("Failed to allocate memory for a21").clone();
+        let mut a22 = pool.allocate().expect("Failed to allocate memory for a22").clone();
+        println!("Allocating matrix. Free count: {}", pool.free_indices.len());
+
+        // Fill the matrices with appropriate data from the original matrix
         for i in 0..self.rows {
             if i < mid {
-                a11_data.extend_from_slice(&self.data[i * self.cols..i * self.cols + mid]);
-                a12_data.extend_from_slice(&self.data[i * self.cols + mid..(i + 1) * self.cols]);
+                a11.data.extend_from_slice(&self.data[i * self.cols..i * self.cols + mid]);
+                a12.data.extend_from_slice(&self.data[i * self.cols + mid..(i + 1) * self.cols]);
             } else {
-                a21_data.extend_from_slice(&self.data[i * self.cols..i * self.cols + mid]);
-                a22_data.extend_from_slice(&self.data[i * self.cols + mid..(i + 1) * self.cols]);
+                a21.data.extend_from_slice(&self.data[i * self.cols..i * self.cols + mid]);
+                a22.data.extend_from_slice(&self.data[i * self.cols + mid..(i + 1) * self.cols]);
             }
         }
-    
-        (
-            Matrix { rows: mid, cols: mid, data: a11_data },
-            Matrix { rows: mid, cols: mid, data: a12_data },
-            Matrix { rows: mid, cols: mid, data: a21_data },
-            Matrix { rows: mid, cols: mid, data: a22_data }
-        )
+
+        (a11, a12, a21, a22)
     }
+
+    
     fn merge(a11: Matrix, a12: Matrix, a21: Matrix, a22: Matrix) -> Matrix {
         let new_rows = a11.rows + a21.rows;
         let new_cols = a11.cols + a12.cols;
@@ -325,7 +357,7 @@ impl Mul for Matrix{
     type Output = Matrix;
 
     fn mul(self, other: Matrix) -> Matrix{
-        self.__strassen_multiply(&other)
+        self.strassen_multiply(&other)
     }
 }
 
@@ -333,7 +365,7 @@ impl<'a,'b> Mul<&'b Matrix> for &'a Matrix{
     type Output = Matrix;
 
     fn mul(self, other: &'b Matrix) -> Matrix{
-        self.__strassen_multiply(&other)
+        self.strassen_multiply(&other)
     }
 }
 

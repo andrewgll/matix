@@ -8,3 +8,4 @@ pub type FloatType = f64;
 
 
 pub mod matrix;
+pub mod matrix_memory_pool;
